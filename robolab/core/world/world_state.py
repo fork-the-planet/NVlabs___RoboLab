@@ -35,6 +35,33 @@ from isaaclab.utils.math import transform_points
 from isaacsim.core.prims import XFormPrim
 from pxr import Gf, Usd, UsdGeom
 
+try:
+    # IsaacLab 2.3 / IsaacSim 5.1 — scene extras are isaaclab.sim.views.XformPrimView
+    from isaaclab.sim.views import XformPrimView
+
+    XFORM_PRIM_TYPES: tuple[type, ...] = (XFormPrim, XformPrimView)
+
+    def _get_scales_usd_float3_safe(self, indices=None) -> torch.Tensor:
+        """Replacement for XformPrimView._get_scales_usd (IsaacLab 2.3.2.post1).
+
+        Upstream assigns ``prim.GetAttribute("xformOp:scale").Get()`` into a
+        ``Vt.Vec3dArray``, which raises ``TypeError: No registered converter ...
+        GfVec3d`` for any prim whose scale is authored as ``float3`` (Gf.Vec3f) —
+        which is how all RoboLab scene assets author it. Only ``double3`` scales
+        survive. Read through plain tuples instead; works for both precisions.
+        """
+        if indices is None or indices == slice(None):
+            indices_list = self._ALL_INDICES
+        else:
+            indices_list = indices.tolist() if isinstance(indices, torch.Tensor) else list(indices)
+        scales = [tuple(self._prims[i].GetAttribute("xformOp:scale").Get()) for i in indices_list]
+        return torch.tensor(scales, dtype=torch.float32, device=self._device)
+
+    XformPrimView._get_scales_usd = _get_scales_usd_float3_safe
+except ImportError:
+    # IsaacLab 2.2 / IsaacSim 5.0 — scene extras are isaacsim.core.prims.XFormPrim
+    XFORM_PRIM_TYPES = (XFormPrim,)
+
 import robolab.constants
 import robolab.core.utils.usd_utils as usd_utils
 from robolab.core.sensors.contact_sensor_utils import (
@@ -116,7 +143,8 @@ class WorldState:
         return entities
 
     @property
-    def extras(self) -> dict[str, XFormPrim]:
+    def extras(self) -> dict:
+        """Scene extras: XFormPrim on IsaacLab 2.2, XformPrimView on 2.3."""
         return self.env.scene.extras
 
     @property
@@ -362,7 +390,7 @@ class WorldState:
         """Get USD prim for a body in a specific env. Used internally for init-time
         geometry caching and visualization. Not called per-step."""
         body = self.get_body(body_name)
-        if isinstance(body, XFormPrim):
+        if isinstance(body, XFORM_PRIM_TYPES):
             idx = min(env_id, len(body.prims) - 1)
             return body.prims[idx]
         prim_path = body.cfg.prim_path
@@ -392,7 +420,7 @@ class WorldState:
                 quat = body.data.root_quat_w.clone().detach()  # (N, 4)
                 if is_relative:
                     pos = pos - self.env.scene.env_origins  # (N, 3)
-        elif isinstance(body, XFormPrim):
+        elif isinstance(body, XFORM_PRIM_TYPES):
             num_prims = len(body._prim_paths) if hasattr(body, '_prim_paths') else body.count
             if env_id is not None:
                 # Clamp index — static extras may have fewer prims than envs
@@ -461,7 +489,7 @@ class WorldState:
             env_id: None → (num_envs, 6), int → (6,)
         """
         body = self.get_body(body_name)
-        if isinstance(body, XFormPrim):
+        if isinstance(body, XFORM_PRIM_TYPES):
             if env_id is None:
                 return torch.zeros(self.env.num_envs, 6, dtype=torch.float32, device=self.env.device)
             return torch.zeros(6, dtype=torch.float32, device=self.env.device)
